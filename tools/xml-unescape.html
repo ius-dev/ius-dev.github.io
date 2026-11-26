@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XML 转义还原 · ius-dev 工具集</title>
+<meta name="description" content="把 &lt; &gt; &amp; &quot; &apos; 以及 &#x…; 这类实体还原成正常字符，支持多层转义，全部在浏览器本地处理。">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../">ius-dev <span>工具集</span></a>
+    <a class="nav-back" href="../">← 全部工具</a>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <header class="tool-head">
+    <h1>XML 转义还原</h1>
+    <p>
+      把 <code>&amp;lt;</code> <code>&amp;gt;</code> <code>&amp;amp;</code> <code>&amp;quot;</code>
+      <code>&amp;apos;</code> 以及 <code>&amp;#x…;</code> 这类实体还原成正常字符，支持多层转义。
+      用于查看 NSHIS SOAP 日志里被转义的 <code>Msg</code> 内层报文等场景。
+    </p>
+  </header>
+
+  <section class="toolbar">
+    <label for="passes">
+      解码层数
+      <select id="passes">
+        <option value="auto">自动（直到稳定）</option>
+        <option value="1">1 层</option>
+        <option value="2">2 层</option>
+        <option value="3">3 层</option>
+      </select>
+    </label>
+    <div class="actions">
+      <button id="sample" type="button">填入示例</button>
+      <button id="clear" type="button">清空</button>
+    </div>
+    <div class="status" id="status">等待输入</div>
+  </section>
+
+  <section class="panes">
+    <div class="pane">
+      <div class="pane-head">
+        <span>输入（转义文本）</span>
+        <span class="meta"><span id="inMeta">0 字符</span></span>
+      </div>
+      <textarea id="input" spellcheck="false" placeholder="粘贴包含 &amp;lt; &amp;gt; &amp;amp; 等实体的文本…"></textarea>
+    </div>
+    <div class="pane">
+      <div class="pane-head">
+        <span>输出（还原结果）</span>
+        <span class="meta">
+          <span id="outMeta">0 字符</span>
+          <button id="copy" class="copy" type="button">复制</button>
+        </span>
+      </div>
+      <textarea id="output" class="output-text" spellcheck="false" readonly placeholder="还原结果会显示在这里"></textarea>
+    </div>
+  </section>
+
+  <footer class="tool-footer">
+    仅在当前浏览器内处理，内容不会上传。还原后的日志可能包含患者姓名、身份证号等隐私，请注意留存与转发范围。
+  </footer>
+
+</main>
+
+<script>
+(function () {
+  'use strict';
+
+  var NAMED = {
+    amp: '&',
+    lt: '<',
+    gt: '>',
+    quot: '"',
+    apos: "'",
+    nbsp: ' '
+  };
+
+  var ENTITY = /&(#[xX][0-9a-fA-F]+|#[0-9]+|[a-zA-Z][a-zA-Z0-9]*);/g;
+
+  function decodeOnce(text) {
+    var hits = 0;
+    var result = text.replace(ENTITY, function (match, body) {
+      if (body.charCodeAt(0) === 35) {
+        var hex = body.charAt(1) === 'x' || body.charAt(1) === 'X';
+        var code = parseInt(body.slice(hex ? 2 : 1), hex ? 16 : 10);
+        if (code > 0 && code <= 0x10FFFF) {
+          hits++;
+          // 代理区按单个码元还原，成对的 &#xD83D;&#xDE00; 会在结果中自然拼成完整字符。
+          return code <= 0xFFFF ? String.fromCharCode(code) : String.fromCodePoint(code);
+        }
+        return match;
+      }
+      if (Object.prototype.hasOwnProperty.call(NAMED, body)) {
+        hits++;
+        return NAMED[body];
+      }
+      return match;
+    });
+    return { text: result, hits: hits };
+  }
+
+  function decodeText(text, mode) {
+    var maxLayers = mode === 'auto' ? 10 : Number(mode);
+    var current = text;
+    var layers = 0;
+    var hits = 0;
+    for (var i = 0; i < maxLayers; i++) {
+      var step = decodeOnce(current);
+      if (step.hits === 0) {
+        break;
+      }
+      current = step.text;
+      layers++;
+      hits += step.hits;
+    }
+    return {
+      text: current,
+      layers: layers,
+      hits: hits,
+      remaining: decodeOnce(current).hits
+    };
+  }
+
+  var els = {
+    input: document.getElementById('input'),
+    output: document.getElementById('output'),
+    passes: document.getElementById('passes'),
+    status: document.getElementById('status'),
+    inMeta: document.getElementById('inMeta'),
+    outMeta: document.getElementById('outMeta'),
+    copy: document.getElementById('copy'),
+    sample: document.getElementById('sample'),
+    clear: document.getElementById('clear')
+  };
+
+  function chars(n) {
+    return n.toLocaleString('zh-CN') + ' 字符';
+  }
+
+  function refresh() {
+    var source = els.input.value;
+    els.inMeta.textContent = chars(source.length);
+
+    if (!source) {
+      els.output.value = '';
+      els.outMeta.textContent = chars(0);
+      els.status.textContent = '等待输入';
+      els.status.classList.remove('active');
+      return;
+    }
+
+    var result = decodeText(source, els.passes.value);
+    els.output.value = result.text;
+    els.outMeta.textContent = chars(result.text.length);
+
+    if (result.layers === 0) {
+      els.status.textContent = '没有可解码的实体';
+      els.status.classList.remove('active');
+      return;
+    }
+
+    var label = '已解码 ' + result.layers + ' 层 · 共 ' + result.hits + ' 个实体';
+    if (result.remaining > 0) {
+      label += ' · 仍有 ' + result.remaining + ' 个未解码';
+    }
+    els.status.textContent = label;
+    els.status.classList.add('active');
+  }
+
+  var copyTimer = null;
+  function flashCopy(text) {
+    els.copy.textContent = text;
+    if (copyTimer) {
+      clearTimeout(copyTimer);
+    }
+    copyTimer = setTimeout(function () {
+      els.copy.textContent = '复制';
+    }, 1200);
+  }
+
+  function copyOutput() {
+    var text = els.output.value;
+    if (!text) {
+      return;
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () {
+        flashCopy('已复制');
+      }, function () {
+        fallbackCopy(text);
+      });
+    } else {
+      fallbackCopy(text);
+    }
+  }
+
+  function fallbackCopy(text) {
+    try {
+      els.output.select();
+      document.execCommand('copy');
+      flashCopy('已复制');
+    } catch (e) {
+      flashCopy('复制失败');
+    }
+  }
+
+  var SAMPLE = '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">'
+    + '<soap:Body><Process xmlns="CommWebService"><Msg>'
+    + '&lt;Requset&gt;&lt;method&gt;EQ8002&lt;/method&gt;'
+    + '&lt;patientname&gt;张三&lt;/patientname&gt;'
+    + '&lt;idno&gt;110101199001011234&lt;/idno&gt;'
+    + '&lt;cardno&gt;A&amp;amp;B&lt;/cardno&gt;'
+    + '&lt;/Requset&gt;'
+    + '</Msg></Process></soap:Body></soap:Envelope>';
+
+  els.input.addEventListener('input', refresh);
+  els.passes.addEventListener('change', refresh);
+  els.copy.addEventListener('click', copyOutput);
+  els.clear.addEventListener('click', function () {
+    els.input.value = '';
+    refresh();
+    els.input.focus();
+  });
+  els.sample.addEventListener('click', function () {
+    els.input.value = SAMPLE;
+    els.passes.value = 'auto';
+    refresh();
+    els.input.focus();
+    els.input.scrollTop = 0;
+    els.input.scrollLeft = 0;
+    els.output.scrollTop = 0;
+    els.output.scrollLeft = 0;
+  });
+
+  refresh();
+})();
+</script>
+</body>
+</html>
