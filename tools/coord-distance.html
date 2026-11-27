@@ -1,0 +1,923 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>经纬度距离与相对位置 · ius-dev 工具集</title>
+<meta name="description" content="录入多个经纬度坐标，计算各点之间距离、相对参考点的方位角与东西南北偏移，全部在浏览器本地处理。">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../">ius-dev <span>工具集</span></a>
+    <a class="nav-back" href="../">← 全部工具</a>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <header class="tool-head">
+    <h1>经纬度距离与相对位置</h1>
+    <p>
+      录入任意多个经纬度坐标，指定其中一个作为参考点，得到每个点到参考点的球面距离、方位角、
+      东西与南北偏移，以及所有点两两之间的距离；所有点同时画在同一张示意图上，可缩放、拖动。
+    </p>
+  </header>
+
+  <section class="toolbar">
+    <label for="origin">
+      参考点
+      <select id="origin"></select>
+    </label>
+    <div class="actions">
+      <button id="add" type="button">添加坐标点</button>
+      <button id="sample" type="button">填入示例</button>
+      <button id="clear" type="button">清空</button>
+    </div>
+    <div class="status" id="status">等待输入</div>
+  </section>
+
+  <section class="panes">
+    <div class="pane">
+      <div class="pane-head">
+        <span>坐标点</span>
+        <span class="meta"><span id="count">0 个点</span></span>
+      </div>
+      <div class="pane-body">
+        <div class="field-rows" id="rows"></div>
+        <button id="add2" class="field-add" type="button">+ 添加坐标点</button>
+        <p class="pane-hint">
+          每行一个点。坐标支持 <code>31.2304, 121.4737</code>、<code>31.2304 121.4737</code>、
+          <code>31°13'49.4"N 121°28'25.3"E</code> 等写法；<code>121.4737, 31.2304</code>
+          这种经纬颠倒的顺序会自动纠正。
+        </p>
+      </div>
+    </div>
+    <div class="pane">
+      <div class="pane-head">
+        <span>相对位置与距离</span>
+        <span class="meta">
+          <button id="copy" class="copy" type="button">复制</button>
+        </span>
+      </div>
+      <div class="pane-body" id="results"></div>
+    </div>
+  </section>
+
+  <section class="pane map-pane">
+    <div class="pane-head">
+      <span>示意图</span>
+      <span class="meta">
+        <span class="zoom-group">
+          <button id="zoomIn" type="button" title="放大" aria-label="放大">+</button>
+          <button id="zoomOut" type="button" title="缩小" aria-label="缩小">−</button>
+          <button id="zoomFit" type="button">适应窗口</button>
+        </span>
+      </span>
+    </div>
+    <div class="map-stage" id="mapStage">
+      <svg id="map" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="坐标点示意图"></svg>
+      <p class="map-empty" id="mapEmpty">录入坐标后，所有点会显示在同一张示意图上。</p>
+    </div>
+  </section>
+
+  <footer class="tool-footer">
+    距离按球面大圆（Haversine，平均地球半径 6371.0088 公里）计算，方位为从参考点出发的初始方位角；
+    东西/南北偏移为该距离在经纬方向上的分解，短距离下可当作平面直角坐标理解。
+    示意图按等距圆柱投影在本地绘制，可滚轮缩放、拖动平移、双击复位。
+    全部计算在本机完成，坐标不会上传，也不会请求任何在线地图服务。
+  </footer>
+
+</main>
+
+<script>
+(function () {
+  'use strict';
+
+  var EARTH_R = 6371008.8;
+  var M_PER_DEG = Math.PI * EARTH_R / 180;   // ≈ 111194.9 米
+  var DIRS = ['北', '北北东', '东北', '东北东', '东', '东南东', '东南', '南南东',
+              '南', '南南西', '西南', '西南西', '西', '西北西', '西北', '北北西'];
+
+  var SAMPLE = [
+    ['人民广场', '31.2304, 121.4737'],
+    ['外滩', '31.2397, 121.4903'],
+    ['陆家嘴', '31.2397, 121.4998'],
+    ['虹桥火车站', '31.1946, 121.3196']
+  ];
+
+  function toRad(deg) { return deg * Math.PI / 180; }
+
+  /* ---------- 坐标解析 ---------- */
+
+  // 单个数值段：支持 31.2304 / 31°13'49.4" / 带 N S E W 后缀
+  function parseChunk(chunk) {
+    var nums = chunk.match(/-?\d+(?:\.\d+)?/g);
+    if (!nums || nums.length > 3) { return null; }
+    var hemi = (chunk.match(/[NSEWnsew]/) || [''])[0].toUpperCase();
+    var negative = /^\s*-/.test(chunk) || hemi === 'S' || hemi === 'W';
+    var scale = [1, 60, 3600];
+    var value = 0;
+    for (var i = 0; i < nums.length; i++) {
+      value += Math.abs(parseFloat(nums[i])) / scale[i];
+    }
+    return negative ? -value : value;
+  }
+
+  function parseCoords(text) {
+    var s = String(text).replace(/[，、；;]/g, ',').replace(/\s+/g, ' ').trim();
+    if (!s) { return null; }
+    // 半球字母与其后的数值之间补逗号，兼容 31.2N 121.4E、31°13'49"N 121°28'25"E
+    s = s.replace(/([NSEWnsew])(?= ?-?\d)/g, '$1,');
+
+    function splitBy(sep) {
+      return s.split(sep).map(function (part) { return part.trim(); })
+        .filter(function (part) { return part !== ''; });
+    }
+
+    var chunks = splitBy(',');
+    if (chunks.length !== 2) { chunks = splitBy(' '); }
+    if (chunks.length !== 2) { return null; }
+
+    var first = parseChunk(chunks[0]);
+    var second = parseChunk(chunks[1]);
+    if (first === null || second === null) { return null; }
+
+    var h1 = (chunks[0].match(/[NSEWnsew]/) || [''])[0].toUpperCase();
+    var h2 = (chunks[1].match(/[NSEWnsew]/) || [''])[0].toUpperCase();
+
+    var lat = first;
+    var lng = second;
+    if (h1 === 'E' || h1 === 'W' || h2 === 'N' || h2 === 'S') {
+      lat = second;
+      lng = first;
+    } else if (Math.abs(lat) > 90 && Math.abs(lng) <= 90) {
+      lat = second;
+      lng = first;
+    }
+
+    if (!isFinite(lat) || !isFinite(lng)) { return null; }
+    if (Math.abs(lat) > 90 || Math.abs(lng) > 180) { return null; }
+    return { lat: lat, lng: lng };
+  }
+
+  /* ---------- 几何计算 ---------- */
+
+  function distance(a, b) {
+    var dLat = toRad(b.lat - a.lat);
+    var dLng = toRad(b.lng - a.lng);
+    var h = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+      + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+    return 2 * EARTH_R * Math.asin(Math.min(1, Math.sqrt(h)));
+  }
+
+  function bearing(a, b) {
+    var p1 = toRad(a.lat);
+    var p2 = toRad(b.lat);
+    var dl = toRad(b.lng - a.lng);
+    var y = Math.sin(dl) * Math.cos(p2);
+    var x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+    return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+  }
+
+  function dirName(deg) {
+    return DIRS[Math.round((((deg % 360) + 360) % 360) / 22.5) % 16];
+  }
+
+  // 同时给出距离、方位与东西/南北偏移
+  function relation(a, b) {
+    var d = distance(a, b);
+    if (d < 0.5) {
+      return { dist: d, bearing: null, dir: '同一点', east: 0, north: 0 };
+    }
+    var brg = bearing(a, b);
+    return {
+      dist: d,
+      bearing: brg,
+      dir: dirName(brg),
+      east: d * Math.sin(toRad(brg)),
+      north: d * Math.cos(toRad(brg))
+    };
+  }
+
+  /* ---------- 格式化 ---------- */
+
+  function fmtDist(m) {
+    if (!isFinite(m)) { return '—'; }
+    if (m < 1) { return m.toFixed(2) + ' 米'; }
+    if (m < 1000) { return m.toFixed(1) + ' 米'; }
+    if (m < 10000) { return (m / 1000).toFixed(2) + ' 公里'; }
+    if (m < 100000) { return (m / 1000).toFixed(1) + ' 公里'; }
+    return Math.round(m / 1000).toLocaleString('zh-CN') + ' 公里';
+  }
+
+  function fmtOffset(m) {
+    if (Math.abs(m) < 0.5) { return '0'; }
+    return (m > 0 ? '+' : '−') + fmtDist(Math.abs(m));
+  }
+
+  function fmtBearing(rel) {
+    return rel.bearing === null ? '—' : rel.bearing.toFixed(1) + '°';
+  }
+
+  function fmtCoord(p) {
+    return p.lat.toFixed(6) + ', ' + p.lng.toFixed(6);
+  }
+
+  function fmtShortDist(m) {
+    if (m >= 1000) {
+      var km = m / 1000;
+      return (km >= 10 ? km.toFixed(0) : km.toFixed(1)) + ' 公里';
+    }
+    if (m < 1) { return (m * 100).toFixed(m * 100 < 10 ? 1 : 0) + ' 厘米'; }
+    return (m >= 10 ? Math.round(m) : m.toFixed(1)) + ' 米';
+  }
+
+  // 取 1 / 2 / 5 × 10ⁿ 的“整齐”刻度
+  function niceStep(rough) {
+    if (!isFinite(rough) || rough <= 0) { return 1; }
+    var pow = Math.pow(10, Math.floor(Math.log(rough) / Math.LN10));
+    var n = rough / pow;
+    var mult = n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10;
+    return mult * pow;
+  }
+
+  function decimalsFor(step) {
+    var d = Math.ceil(-Math.log(step) / Math.LN10);
+    return Math.max(0, Math.min(6, d));
+  }
+
+  function esc(text) {
+    return String(text).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  /* ---------- 页面状态 ---------- */
+
+  var els = {
+    rows: document.getElementById('rows'),
+    origin: document.getElementById('origin'),
+    results: document.getElementById('results'),
+    status: document.getElementById('status'),
+    count: document.getElementById('count'),
+    copy: document.getElementById('copy'),
+    add: document.getElementById('add'),
+    add2: document.getElementById('add2'),
+    sample: document.getElementById('sample'),
+    clear: document.getElementById('clear'),
+    stage: document.getElementById('mapStage'),
+    svg: document.getElementById('map'),
+    mapEmpty: document.getElementById('mapEmpty'),
+    zoomIn: document.getElementById('zoomIn'),
+    zoomOut: document.getElementById('zoomOut'),
+    zoomFit: document.getElementById('zoomFit')
+  };
+
+  var snapshot = null;
+  var originSignature = '';
+  var mapView = { z: 1, panX: 0, panY: 0 };
+  var mapData = null;
+  var mapGeom = null;
+
+  function rowNodes() {
+    return Array.prototype.slice.call(els.rows.querySelectorAll('.field-row'));
+  }
+
+  function nextName() {
+    var n = els.rows.children.length;
+    return n < 26 ? String.fromCharCode(65 + n) : '点 ' + (n + 1);
+  }
+
+  function addRow(name, value, focus) {
+    var row = document.createElement('div');
+    row.className = 'field-row';
+    row.innerHTML = '<input class="coord-name" type="text" placeholder="名称" spellcheck="false">'
+      + '<input class="coord-value" type="text" placeholder="纬度, 经度" spellcheck="false">'
+      + '<button class="row-remove" type="button" title="删除这个点" aria-label="删除这个点">×</button>';
+    row.querySelector('.coord-name').value = name || nextName();
+    row.querySelector('.coord-value').value = value || '';
+    els.rows.appendChild(row);
+    if (focus) { row.querySelector('.coord-value').focus(); }
+    return row;
+  }
+
+  function collectPoints() {
+    var points = [];
+    var bad = [];
+    rowNodes().forEach(function (row, i) {
+      var valueEl = row.querySelector('.coord-value');
+      var nameEl = row.querySelector('.coord-name');
+      var raw = valueEl.value.trim();
+      valueEl.classList.remove('invalid');
+      if (!raw) { return; }
+      var parsed = parseCoords(raw);
+      if (!parsed) {
+        valueEl.classList.add('invalid');
+        bad.push(i + 1);
+        return;
+      }
+      points.push({
+        name: nameEl.value.trim() || ('点 ' + (points.length + 1)),
+        lat: parsed.lat,
+        lng: parsed.lng
+      });
+    });
+    return { points: points, bad: bad };
+  }
+
+  function buildSnapshot(points, originIndex) {
+    var origin = points[originIndex];
+    var rel = points.map(function (p, i) {
+      if (i === originIndex) {
+        return {
+          name: p.name, coord: fmtCoord(p), isRef: true,
+          dist: '—', bearing: '—', dir: '参考点', east: '—', north: '—'
+        };
+      }
+      var r = relation(origin, p);
+      return {
+        name: p.name, coord: fmtCoord(p), isRef: false,
+        dist: fmtDist(r.dist), bearing: fmtBearing(r), dir: r.dir,
+        east: fmtOffset(r.east), north: fmtOffset(r.north)
+      };
+    });
+
+    var pairs = [];
+    for (var i = 0; i < points.length; i++) {
+      for (var j = i + 1; j < points.length; j++) {
+        var r = relation(points[i], points[j]);
+        pairs.push({
+          a: points[i].name,
+          b: points[j].name,
+          dist: fmtDist(r.dist),
+          bearing: fmtBearing(r),
+          dir: r.dir
+        });
+      }
+    }
+
+    return {
+      origin: { name: origin.name, coord: fmtCoord(origin) },
+      rel: rel,
+      pairs: pairs
+    };
+  }
+
+  /* ---------- 结果渲染 ---------- */
+
+  function buildTable(title, head, body) {
+    var block = document.createElement('div');
+    var h = document.createElement('h4');
+    h.textContent = title;
+    block.appendChild(h);
+
+    var wrap = document.createElement('div');
+    wrap.className = 'table-wrap';
+
+    var table = document.createElement('table');
+    table.className = 'data-table';
+
+    var thead = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    head.forEach(function (text) {
+      var th = document.createElement('th');
+      th.textContent = text;
+      headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    var tbody = document.createElement('tbody');
+    body.forEach(function (cells) {
+      var tr = document.createElement('tr');
+      cells.forEach(function (cell) {
+        var td = document.createElement('td');
+        var conf = typeof cell === 'string' ? { text: cell } : cell;
+        td.textContent = conf.text;
+        if (conf.num) { td.className = 'num'; }
+        else if (conf.cls) { td.className = conf.cls; }
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+
+    wrap.appendChild(table);
+    block.appendChild(wrap);
+    return block;
+  }
+
+  function renderResults(snap) {
+    els.results.innerHTML = '';
+
+    if (!snap) {
+      var empty = document.createElement('p');
+      empty.className = 'placeholder-text';
+      empty.textContent = '在上面录入至少一个坐标点，结果会显示在这里。';
+      els.results.appendChild(empty);
+      return;
+    }
+
+    var refLine = document.createElement('p');
+    refLine.className = 'placeholder-text';
+    refLine.textContent = '参考点：' + snap.origin.name + '（' + snap.origin.coord + '）';
+    els.results.appendChild(refLine);
+
+    els.results.appendChild(buildTable(
+      '到参考点的距离与方位',
+      ['点', '距离', '方位', '东西偏移', '南北偏移'],
+      snap.rel.map(function (r) {
+        var cls = r.isRef ? 'is-ref' : '';
+        return [
+          { text: r.name, cls: cls },
+          { text: r.dist, cls: cls },
+          { text: r.isRef ? r.dir : r.bearing + ' ' + r.dir, cls: cls },
+          { text: r.east, cls: cls },
+          { text: r.north, cls: cls }
+        ];
+      })
+    ));
+
+    if (snap.pairs.length) {
+      els.results.appendChild(buildTable(
+        '两点之间距离',
+        ['起点', '终点', '距离', '方位（起点→终点）'],
+        snap.pairs.map(function (p) {
+          return [p.a, p.b, p.dist, p.bearing + ' ' + p.dir];
+        })
+      ));
+    }
+  }
+
+  function buildText(snap) {
+    var out = ['参考点：' + snap.origin.name + '（' + snap.origin.coord + '）', '', '到参考点的距离与方位'];
+    snap.rel.forEach(function (r) {
+      if (r.isRef) { return; }
+      out.push('- ' + r.name + '：' + r.dist + '，方位角 ' + r.bearing + '（' + r.dir + '）'
+        + '，东西 ' + r.east + '，南北 ' + r.north);
+    });
+    if (snap.pairs.length) {
+      out.push('', '两点之间距离');
+      snap.pairs.forEach(function (p) {
+        out.push('- ' + p.a + ' → ' + p.b + '：' + p.dist + '，方位角 ' + p.bearing + '（' + p.dir + '）');
+      });
+    }
+    return out.join('\n');
+  }
+
+  /* ---------- 示意图（本地 SVG） ---------- */
+
+  // 等距圆柱投影：以所有点的经纬度均值为原点，x 为东向米数，y 为北向米数
+  function projectPoints(points) {
+    var lat0 = 0;
+    var lng0 = 0;
+    points.forEach(function (p) { lat0 += p.lat; lng0 += p.lng; });
+    lat0 /= points.length;
+    lng0 /= points.length;
+    var kx = M_PER_DEG * Math.cos(toRad(lat0));
+    return {
+      lat0: lat0,
+      lng0: lng0,
+      kx: kx,
+      pts: points.map(function (p) {
+        return {
+          name: p.name, lat: p.lat, lng: p.lng,
+          x: (p.lng - lng0) * kx,
+          y: -(p.lat - lat0) * M_PER_DEG
+        };
+      })
+    };
+  }
+
+  function drawMap() {
+    var stage = els.stage;
+    var W = Math.max(120, stage.clientWidth || 600);
+    var H = Math.max(120, stage.clientHeight || 420);
+
+    if (!mapData || !mapData.points.length) {
+      els.svg.innerHTML = '';
+      els.svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+      mapGeom = null;
+      els.mapEmpty.hidden = false;
+      return;
+    }
+    els.mapEmpty.hidden = true;
+
+    var proj = projectPoints(mapData.points);
+    var pts = proj.pts;
+    var originIndex = mapData.originIndex;
+
+    var xs = pts.map(function (p) { return p.x; });
+    var ys = pts.map(function (p) { return p.y; });
+    var minX = Math.min.apply(null, xs);
+    var maxX = Math.max.apply(null, xs);
+    var minY = Math.min.apply(null, ys);
+    var maxY = Math.max.apply(null, ys);
+    var MIN_SPAN = 60;                    // 单点或重合点时给个可读的最小范围（米）
+    var spanX = Math.max(maxX - minX, MIN_SPAN);
+    var spanY = Math.max(maxY - minY, MIN_SPAN);
+    var cx = (minX + maxX) / 2;
+    var cy = (minY + maxY) / 2;
+
+    var pad = 62;
+    var base = Math.min((W - 2 * pad) / spanX, (H - 2 * pad) / spanY);
+    if (!isFinite(base) || base <= 0) { base = 1; }
+    var s = base * mapView.z;             // 当前像素/米
+
+    function px(x) { return W / 2 + (x - cx) * s + mapView.panX; }
+    function py(y) { return H / 2 + (y - cy) * s + mapView.panY; }
+
+    mapGeom = {
+      W: W, H: H, base: base, cx: cx, cy: cy,
+      kx: proj.kx, lat0: proj.lat0, lng0: proj.lng0
+    };
+
+    var out = [];
+
+    /* 经纬网 */
+    var pxPerLatDeg = s * M_PER_DEG;
+    var pxPerLngDeg = s * proj.kx;
+    var stepLat = niceStep(78 / pxPerLatDeg);
+    var stepLng = niceStep(78 / pxPerLngDeg);
+    var latDec = decimalsFor(stepLat);
+    var lngDec = decimalsFor(stepLng);
+
+    var latTop = proj.lat0 - (cy + (0 - H / 2 - mapView.panY) / s) / M_PER_DEG;
+    var latBottom = proj.lat0 - (cy + (H - H / 2 - mapView.panY) / s) / M_PER_DEG;
+    var lngLeft = proj.lng0 + (cx + (0 - W / 2 - mapView.panX) / s) / proj.kx;
+    var lngRight = proj.lng0 + (cx + (W - W / 2 - mapView.panX) / s) / proj.kx;
+
+    var grid = [];
+    for (var lng = Math.ceil(lngLeft / stepLng) * stepLng; lng <= lngRight; lng += stepLng) {
+      var gx = px((lng - proj.lng0) * proj.kx);
+      grid.push('<line x1="' + gx.toFixed(1) + '" y1="0" x2="' + gx.toFixed(1) + '" y2="' + H + '"/>');
+      grid.push('<text x="' + (gx + 3).toFixed(1) + '" y="14" text-anchor="start">'
+        + lng.toFixed(lngDec) + '°</text>');
+    }
+    for (var lat = Math.ceil(latBottom / stepLat) * stepLat; lat <= latTop; lat += stepLat) {
+      var gy = py(-(lat - proj.lat0) * M_PER_DEG);
+      grid.push('<line x1="0" y1="' + gy.toFixed(1) + '" x2="' + W + '" y2="' + gy.toFixed(1) + '"/>');
+      grid.push('<text x="6" y="' + (gy - 4).toFixed(1) + '" text-anchor="start">'
+        + lat.toFixed(latDec) + '°</text>');
+    }
+    out.push('<g class="map-grid">' + grid.join('') + '</g>');
+
+    /* 参考点到各点的连线 */
+    var origin = pts[originIndex];
+    var ox = px(origin.x);
+    var oy = py(origin.y);
+    var links = [];
+    pts.forEach(function (p, i) {
+      if (i === originIndex) { return; }
+      var d = distance(origin, p);
+      if (d < 0.5) { return; }
+      var l = { x1: ox, y1: oy, x2: px(p.x), y2: py(p.y), dist: d };
+      links.push(l);
+      out.push('<line class="map-link" x1="' + l.x1.toFixed(1) + '" y1="' + l.y1.toFixed(1)
+        + '" x2="' + l.x2.toFixed(1) + '" y2="' + l.y2.toFixed(1) + '"/>');
+    });
+
+    /* 标签避让用的占位框 */
+    var markers = pts.map(function (p) { return { x: px(p.x), y: py(p.y) }; });
+    var placed = markers.map(function (m) { return { x: m.x - 7, y: m.y - 7, w: 14, h: 14 }; });
+
+    function textWidth(text) {
+      var w = 0;
+      for (var i = 0; i < text.length; i++) {
+        w += text.charCodeAt(i) > 0x2e80 ? 12 : 6.4;
+      }
+      return w;
+    }
+
+    function hits(box) {
+      for (var i = 0; i < placed.length; i++) {
+        var o = placed[i];
+        if (box.x < o.x + o.w && box.x + box.w > o.x && box.y < o.y + o.h && box.y + box.h > o.y) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    // 名称标签：优先放在点右侧，被占用则依次换方向、换行位
+    function placeName(x, y, text) {
+      var w = textWidth(text);
+      var flip = x > W - 110 ? -1 : 1;
+      var offs = [
+        [10, 4, 'start'], [10, -14, 'start'], [10, 22, 'start'],
+        [0, 21, 'middle'], [0, -9, 'middle'],
+        [-10, 4, 'end'], [-10, -14, 'end'], [-10, 22, 'end'],
+        [0, 38, 'middle'], [0, -26, 'middle']
+      ];
+      for (var i = 0; i < offs.length; i++) {
+        var dx = offs[i][0] * flip;
+        var dy = offs[i][1];
+        var anchor = offs[i][2];
+        if (flip < 0) { anchor = anchor === 'start' ? 'end' : anchor === 'end' ? 'start' : anchor; }
+        var tx = x + dx;
+        var bx = anchor === 'start' ? tx : anchor === 'end' ? tx - w : tx - w / 2;
+        var box = { x: bx, y: y + dy - 10, w: w, h: 14 };
+        if (!hits(box)) {
+          placed.push(box);
+          return { anchor: anchor, tx: tx, ty: y + dy };
+        }
+      }
+      placed.push({ x: x + 10, y: y - 10, w: w, h: 14 });
+      return { anchor: 'start', tx: x + 10, ty: y + 4 };
+    }
+
+    var nameLabels = [];
+    var order = [originIndex].concat(pts.map(function (p, i) { return i; })
+      .filter(function (i) { return i !== originIndex; }));
+    order.forEach(function (i) {
+      var text = pts[i].name + (i === originIndex ? '（参考）' : '');
+      nameLabels[i] = placeName(markers[i].x, markers[i].y, text);
+    });
+
+    /* 各点 */
+    pts.forEach(function (p, i) {
+      var m = markers[i];
+      var lab = nameLabels[i];
+      var isRef = i === originIndex;
+      out.push('<g class="map-point' + (isRef ? ' ref' : '') + '">'
+        + '<title>' + esc(p.name + ' · ' + fmtCoord(p)) + '</title>'
+        + '<circle cx="' + m.x.toFixed(1) + '" cy="' + m.y.toFixed(1) + '" r="'
+        + (isRef ? 6 : 4.5) + '"/>'
+        + '<text x="' + lab.tx.toFixed(1) + '" y="' + lab.ty.toFixed(1) + '" text-anchor="'
+        + lab.anchor + '">' + esc(p.name) + (isRef ? '（参考）' : '') + '</text>'
+        + '</g>');
+    });
+
+    /* 连线上的距离文字（靠目标点一侧，避开参考点处的名称堆叠） */
+    links.forEach(function (l) {
+      var text = fmtDist(l.dist);
+      var w = textWidth(text);
+      var vx = l.x2 - l.x1;
+      var vy = l.y2 - l.y1;
+      var len = Math.sqrt(vx * vx + vy * vy) || 1;
+      // 连线太短时文字必然压在点上，留给表格显示，放大后再出现
+      if (len < 45) { return; }
+      var nx = -vy / len;
+      var ny = vx / len;
+      var pick = null;
+      [[0.62, 12], [0.62, -12], [0.45, 12], [0.45, -12], [0.78, 12], [0.78, -12],
+       [0.62, 30], [0.62, -30]].some(function (cand) {
+        var mx = l.x1 + vx * cand[0];
+        var my = l.y1 + vy * cand[0];
+        var off = cand[1];
+        var box = { x: mx + nx * off - w / 2, y: my + ny * off - 8, w: w, h: 14 };
+        if (!hits(box)) {
+          pick = box;
+          return true;
+        }
+        return false;
+      });
+      if (!pick) {
+        var fx = l.x1 + vx * 0.62;
+        var fy = l.y1 + vy * 0.62;
+        pick = { x: fx - w / 2, y: fy - 8, w: w, h: 14 };
+      }
+      placed.push(pick);
+      out.push('<text class="map-dist" x="' + (pick.x + w / 2).toFixed(1) + '" y="'
+        + (pick.y + 11).toFixed(1) + '" text-anchor="middle">' + esc(text) + '</text>');
+    });
+
+    /* 比例尺 */
+    var barMeters = niceStep(120 / s);
+    var barPx = barMeters * s;
+    var barX = 18;
+    var barY = H - 20;
+    out.push('<g class="map-scale">'
+      + '<line x1="' + barX + '" y1="' + barY + '" x2="' + (barX + barPx).toFixed(1) + '" y2="' + barY + '"/>'
+      + '<line x1="' + barX + '" y1="' + (barY - 4) + '" x2="' + barX + '" y2="' + (barY + 4) + '"/>'
+      + '<line x1="' + (barX + barPx).toFixed(1) + '" y1="' + (barY - 4) + '" x2="'
+      + (barX + barPx).toFixed(1) + '" y2="' + (barY + 4) + '"/>'
+      + '<text x="' + barX + '" y="' + (barY - 8) + '" text-anchor="start">'
+      + esc(fmtShortDist(barMeters)) + '</text>'
+      + '</g>');
+
+    /* 指北针 */
+    var nx = W - 26;
+    var ny = 34;
+    out.push('<g class="map-north">'
+      + '<path d="M' + nx + ' ' + (ny - 12) + ' L' + (nx + 5.5) + ' ' + (ny + 6) + ' L' + nx + ' '
+      + (ny + 1.5) + ' L' + (nx - 5.5) + ' ' + (ny + 6) + ' Z"/>'
+      + '<text x="' + nx + '" y="' + (ny + 20) + '" text-anchor="middle">N</text>'
+      + '</g>');
+
+    els.svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+    els.svg.innerHTML = out.join('');
+  }
+
+  /* 缩放：以 (mx, my) 为不动点，默认视口中心 */
+  function zoomAbout(factor, mx, my) {
+    if (!mapGeom) { return; }
+    var g = mapGeom;
+    if (mx === undefined) { mx = g.W / 2; }
+    if (my === undefined) { my = g.H / 2; }
+    var s = g.base * mapView.z;
+    var anchorX = g.cx + (mx - g.W / 2 - mapView.panX) / s;
+    var anchorY = g.cy + (my - g.H / 2 - mapView.panY) / s;
+    var z = Math.min(80, Math.max(0.3, mapView.z * factor));
+    var s2 = g.base * z;
+    mapView.z = z;
+    mapView.panX = mx - g.W / 2 - (anchorX - g.cx) * s2;
+    mapView.panY = my - g.H / 2 - (anchorY - g.cy) * s2;
+    drawMap();
+  }
+
+  function resetMapView() {
+    mapView.z = 1;
+    mapView.panX = 0;
+    mapView.panY = 0;
+  }
+
+  var drag = null;
+
+  els.svg.addEventListener('wheel', function (event) {
+    if (!mapGeom) { return; }
+    event.preventDefault();
+    var rect = els.svg.getBoundingClientRect();
+    var factor = Math.exp(-event.deltaY * 0.0015);
+    zoomAbout(factor, event.clientX - rect.left, event.clientY - rect.top);
+  }, { passive: false });
+
+  els.svg.addEventListener('pointerdown', function (event) {
+    if (!mapGeom || event.button !== 0) { return; }
+    drag = { id: event.pointerId, x: event.clientX, y: event.clientY };
+    els.svg.classList.add('dragging');
+    if (els.svg.setPointerCapture) { els.svg.setPointerCapture(event.pointerId); }
+  });
+
+  els.svg.addEventListener('pointermove', function (event) {
+    if (!drag || event.pointerId !== drag.id) { return; }
+    mapView.panX += event.clientX - drag.x;
+    mapView.panY += event.clientY - drag.y;
+    drag.x = event.clientX;
+    drag.y = event.clientY;
+    drawMap();
+  });
+
+  function endDrag(event) {
+    if (!drag) { return; }
+    if (els.svg.releasePointerCapture && event.pointerId === drag.id) {
+      els.svg.releasePointerCapture(drag.id);
+    }
+    drag = null;
+    els.svg.classList.remove('dragging');
+  }
+
+  els.svg.addEventListener('pointerup', endDrag);
+  els.svg.addEventListener('pointercancel', endDrag);
+  els.svg.addEventListener('dblclick', function () {
+    resetMapView();
+    drawMap();
+  });
+
+  els.zoomIn.addEventListener('click', function () { zoomAbout(1.5); });
+  els.zoomOut.addEventListener('click', function () { zoomAbout(1 / 1.5); });
+  els.zoomFit.addEventListener('click', function () {
+    resetMapView();
+    drawMap();
+  });
+
+  window.addEventListener('resize', drawMap);
+
+  /* ---------- 主流程 ---------- */
+
+  function render() {
+    var data = collectPoints();
+    var points = data.points;
+
+    var signature = points.map(function (p) { return p.name + '@' + p.lat + ',' + p.lng; }).join('|');
+    if (signature !== originSignature) {
+      var previous = els.origin.value;
+      els.origin.innerHTML = '';
+      points.forEach(function (p, i) {
+        var opt = document.createElement('option');
+        opt.value = String(i);
+        opt.textContent = (i + 1) + '. ' + p.name;
+        els.origin.appendChild(opt);
+      });
+      var keep = Number(previous);
+      els.origin.value = String(keep >= 0 && keep < points.length ? keep : 0);
+      originSignature = signature;
+      resetMapView();
+    }
+    if (!points.length) { els.origin.value = ''; }
+    els.origin.disabled = points.length < 2;
+
+    var originIndex = Number(els.origin.value);
+    if (!(originIndex >= 0 && originIndex < points.length)) { originIndex = 0; }
+
+    els.count.textContent = points.length + ' 个点';
+
+    if (!points.length) {
+      snapshot = null;
+      mapData = null;
+      renderResults(null);
+      drawMap();
+      els.copy.disabled = true;
+      els.status.textContent = data.bad.length ? '坐标无法识别' : '等待输入';
+      els.status.classList.remove('active');
+      return;
+    }
+
+    snapshot = buildSnapshot(points, originIndex);
+    mapData = { points: points, originIndex: originIndex };
+    renderResults(snapshot);
+    drawMap();
+    els.copy.disabled = points.length < 2;
+
+    var label = points.length + ' 个点 · 参考 ' + snapshot.origin.name;
+    if (points.length === 1) { label += ' · 再加一个点即可比较'; }
+    if (data.bad.length) { label += ' · 第 ' + data.bad.join('、') + ' 行坐标无法识别'; }
+    els.status.textContent = label;
+    els.status.classList.toggle('active', points.length >= 2 && !data.bad.length);
+  }
+
+  var copyTimer = null;
+  function flashCopy(text) {
+    els.copy.textContent = text;
+    if (copyTimer) { clearTimeout(copyTimer); }
+    copyTimer = setTimeout(function () { els.copy.textContent = '复制'; }, 1200);
+  }
+
+  function fallbackCopy(text) {
+    var area = document.createElement('textarea');
+    area.value = text;
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    try {
+      document.execCommand('copy');
+      flashCopy('已复制');
+    } catch (e) {
+      flashCopy('复制失败');
+    }
+    document.body.removeChild(area);
+  }
+
+  function copyResult() {
+    if (!snapshot) { return; }
+    var text = buildText(snapshot);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () {
+        flashCopy('已复制');
+      }, function () {
+        fallbackCopy(text);
+      });
+    } else {
+      fallbackCopy(text);
+    }
+  }
+
+  els.rows.addEventListener('input', render);
+  els.origin.addEventListener('change', render);
+  els.copy.addEventListener('click', copyResult);
+
+  function addOne() {
+    var row = addRow('', '', true);
+    render();
+    row.querySelector('.coord-value').scrollIntoView({ block: 'nearest' });
+  }
+
+  els.add.addEventListener('click', addOne);
+  els.add2.addEventListener('click', addOne);
+
+  els.rows.addEventListener('click', function (event) {
+    var btn = event.target.closest ? event.target.closest('.row-remove') : null;
+    if (!btn) { return; }
+    btn.parentNode.remove();
+    if (!els.rows.children.length) { addRow('', '', false); }
+    render();
+  });
+
+  els.clear.addEventListener('click', function () {
+    els.rows.innerHTML = '';
+    addRow('', '', false);
+    addRow('', '', false);
+    originSignature = '';
+    render();
+    rowNodes()[0].querySelector('.coord-value').focus();
+  });
+
+  els.sample.addEventListener('click', function () {
+    els.rows.innerHTML = '';
+    SAMPLE.forEach(function (item) { addRow(item[0], item[1], false); });
+    originSignature = '';
+    render();
+  });
+
+  addRow('', '', false);
+  addRow('', '', false);
+  render();
+})();
+</script>
+</body>
+</html>
