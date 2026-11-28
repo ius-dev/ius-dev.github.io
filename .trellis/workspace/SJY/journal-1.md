@@ -39,3 +39,24 @@ Topics: [.trellis/spec/guides/reply-language.md](../../spec/guides/reply-languag
 ### Git Commits
 
 (No associated commits)
+
+
+## Session 3: 提交信息格式改为 [类型]: 提交信息
+<!-- trellis-session: v=3 fp=79f001c485ab1634 -->
+
+**Date**: 2026-11-28
+**Task**: 提交信息格式改为 [类型]: 提交信息
+**Branch**: `main`
+
+### Summary
+
+用户确认提交信息格式由「类型: 提交信息」改为「[类型]: 提交信息」，类型仍为小写英文类型名（feat/fix/docs/chore 等），右方括号后紧跟半角冒号和空格。已更新 .trellis/spec/guides/commit-convention.md 的格式说明与示例，并把上一笔字体字符校验工具的提交信息按新格式重写为 [feat]: 新增字体字符校验工具。
+Topics: [.trellis/spec/guides/commit-convention.md](../../spec/guides/commit-convention.md)
+
+### Main Changes
+
+- spec/guides/commit-convention.md：格式改为 [类型]: 提交信息，示例同步更新
+
+### Git Commits
+
+(No associated commits)
