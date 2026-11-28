@@ -14,7 +14,8 @@ ius-dev 的在线工具集。纯静态页面，托管在 GitHub Pages 上。
 │   └── favicon.svg         站点图标
 ├── tools/
 │   ├── xml-unescape.html   XML 转义还原
-│   └── coord-distance.html 经纬度距离与相对位置
+│   ├── coord-distance.html 经纬度距离与相对位置
+│   └── font-char-check.html 字体字符校验
 └── .claude/launch.json     本地预览用的启动配置
 ```
 

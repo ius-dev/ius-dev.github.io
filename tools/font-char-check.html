@@ -1,0 +1,830 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>字体字符校验 · ius-dev 工具集</title>
+<meta name="description" content="选择 TTF/OTF 字体，读取字体的 Unicode cmap，逐字符检查字符串中的每个字是否都在字体里，列出缺失字符的编码与位置，全部在浏览器本地处理。">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../">ius-dev <span>工具集</span></a>
+    <a class="nav-back" href="../">← 全部工具</a>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <header class="tool-head">
+    <h1>字体字符校验</h1>
+    <p>
+      选择一个 <code>.ttf</code> / <code>.otf</code> 字体，读取它的 Unicode cmap，
+      逐字符检查字符串里的每个字是否都被这个字体覆盖，并列出缺失字符的编码、出现次数与位置。
+    </p>
+  </header>
+
+  <section class="toolbar">
+    <label for="fontFile">
+      字体文件
+      <input id="fontFile" type="file" accept=".ttf,.otf,.ttc,font/ttf,font/otf,font/collection">
+    </label>
+    <div class="actions">
+      <button id="sample" type="button">填入示例</button>
+      <button id="clear" type="button">清空</button>
+    </div>
+    <div class="status" id="status">等待选择字体</div>
+  </section>
+
+  <section class="panes">
+    <div class="pane">
+      <div class="pane-head">
+        <span>待校验字符串</span>
+        <span class="meta"><span id="charCount">0 字符</span></span>
+      </div>
+      <textarea id="input" spellcheck="false" placeholder="在这里输入或粘贴需要校验的字符串…"></textarea>
+    </div>
+    <div class="pane">
+      <div class="pane-head">
+        <span>逐字符预览（绿色包含 / 红色缺失）</span>
+        <span class="meta"><span id="fontMeta">尚未选择字体</span></span>
+      </div>
+      <div class="pane-body">
+        <p class="placeholder-text" id="previewEmpty">选择字体并输入字符串后，这里会用所选字体逐字符显示包含情况。</p>
+        <div class="char-preview" id="preview" hidden></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="pane pane-stack">
+    <div class="pane-head">
+      <span>缺失字符明细</span>
+      <span class="meta">
+        <span id="missingMeta">0 种 / 0 处</span>
+        <button id="copy" class="copy" type="button">复制</button>
+      </span>
+    </div>
+    <div class="pane-body" id="missingBody">
+      <p class="placeholder-text" id="missingEmpty">选择字体并输入字符串后，缺失的字符会按编码列在这里。</p>
+    </div>
+  </section>
+
+  <footer class="tool-footer">
+    覆盖情况取自字体 cmap 表中可用的 Unicode 映射（格式 0 / 4 / 6 / 12 / 13），不涉及 GSUB/GPOS 等排版表，
+    因此只能判断“字体里有没有这个字的映射”，不代表该字在任意软件里的实际排版效果；
+    换行、制表符等控制字符不参与校验；<code>.ttc</code> 字体集合只读取其中的第一个字库。
+    字体文件只在当前浏览器内解析，不会上传。
+  </footer>
+
+</main>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ---------- sfnt / cmap 解析 ---------- */
+
+  var PREFERRED_NAMES = [[3, 1, 0x0804], [3, 10, 0x0409], [3, 1, 0x0409], [1, 0, 0]];
+  var MATERIALIZE_LIMIT = 300000;   // 码点总数在此以内时直接建成 Set，保证计数精确
+  var PREVIEW_LIMIT = 20000;        // 预览最多渲染的字符数
+
+  function readTag(view, offset) {
+    return String.fromCharCode(
+      view.getUint8(offset), view.getUint8(offset + 1),
+      view.getUint8(offset + 2), view.getUint8(offset + 3)
+    );
+  }
+
+  function parseTables(buffer) {
+    if (buffer.byteLength < 12) {
+      throw new Error('文件太小，不是有效的 TTF / OTF 字体。');
+    }
+    var view = new DataView(buffer);
+    var signature = readTag(view, 0);
+    var base = 0;
+
+    if (signature === 'ttcf') {
+      if (buffer.byteLength < 16) {
+        throw new Error('字体集合（TTC）文件头不完整。');
+      }
+      base = view.getUint32(12);
+      if (base + 12 > buffer.byteLength) {
+        throw new Error('字体集合（TTC）指向的字库超出文件范围。');
+      }
+    } else if (signature === 'wOFF' || signature === 'wOF2') {
+      throw new Error('暂不支持 WOFF / WOFF2，请使用未压缩的 TTF 或 OTF。');
+    } else if (signature !== 'true' && signature !== 'OTTO' && view.getUint32(0) !== 0x00010000) {
+      throw new Error('无法识别的字体格式，请选择 TTF 或 OTF 文件。');
+    }
+
+    var numTables = view.getUint16(base + 4);
+    var tables = Object.create(null);
+    for (var i = 0; i < numTables; i++) {
+      var p = base + 12 + i * 16;
+      if (p + 16 > buffer.byteLength) {
+        throw new Error('字体表目录不完整，文件可能已损坏。');
+      }
+      tables[readTag(view, p)] = {
+        offset: view.getUint32(p + 8),
+        length: view.getUint32(p + 12)
+      };
+    }
+    if (!tables.cmap) {
+      throw new Error('字体中没有 cmap 表，无法判断字符覆盖情况。');
+    }
+    return { view: view, tables: tables };
+  }
+
+  function isUnicodeEncoding(platformID, encodingID) {
+    if (platformID === 0) { return true; }
+    return platformID === 3 && (encodingID === 0 || encodingID === 1 || encodingID === 10);
+  }
+
+  // cmap 格式 0：256 个单字节映射
+  function format0(view, offset, limit) {
+    if (offset + 6 + 256 > limit) { return null; }
+    var arrayBase = offset + 6;
+    return {
+      size: 256,
+      each: function (cb) {
+        for (var code = 0; code < 256; code++) {
+          if (view.getUint8(arrayBase + code) !== 0) { cb(code); }
+        }
+      },
+      has: function (code) {
+        return code < 256 && view.getUint8(arrayBase + code) !== 0;
+      }
+    };
+  }
+
+  // cmap 格式 4：BMP 分段映射
+  function format4(view, offset, limit) {
+    if (offset + 14 > limit) { return null; }
+    var segCountX2 = view.getUint16(offset + 6);
+    var segCount = segCountX2 >> 1;
+    var endBase = offset + 14;
+    var startBase = endBase + segCountX2 + 2;
+    var deltaBase = startBase + segCountX2;
+    var rangeBase = deltaBase + segCountX2;
+    if (rangeBase + segCountX2 > limit) { return null; }
+
+    function glyphAt(segment, code) {
+      var start = view.getUint16(startBase + segment * 2);
+      var delta = view.getInt16(deltaBase + segment * 2);
+      var range = view.getUint16(rangeBase + segment * 2);
+      var glyph;
+      if (range === 0) {
+        glyph = (code + delta) & 0xFFFF;
+      } else {
+        var index = rangeBase + segment * 2 + range + (code - start) * 2;
+        if (index + 2 > limit) { return 0; }
+        glyph = view.getUint16(index);
+        if (glyph !== 0) { glyph = (glyph + delta) & 0xFFFF; }
+      }
+      return glyph;
+    }
+
+    var size = 0;
+    for (var i = 0; i < segCount; i++) {
+      var s = view.getUint16(startBase + i * 2);
+      var e = view.getUint16(endBase + i * 2);
+      if (e >= s && !(s === 0xFFFF && e === 0xFFFF)) { size += e - s + 1; }
+    }
+
+    return {
+      size: size,
+      each: function (cb) {
+        for (var i = 0; i < segCount; i++) {
+          var start = view.getUint16(startBase + i * 2);
+          var end = view.getUint16(endBase + i * 2);
+          for (var code = start; code <= end; code++) {
+            if (code === 0xFFFF) { continue; }
+            if (glyphAt(i, code) !== 0) { cb(code); }
+          }
+        }
+      },
+      has: function (code) {
+        if (code > 0xFFFF) { return false; }
+        var lo = 0;
+        var hi = segCount - 1;
+        var found = -1;
+        while (lo <= hi) {
+          var mid = (lo + hi) >> 1;
+          if (view.getUint16(endBase + mid * 2) >= code) { found = mid; hi = mid - 1; }
+          else { lo = mid + 1; }
+        }
+        if (found < 0) { return false; }
+        if (view.getUint16(startBase + found * 2) > code) { return false; }
+        return glyphAt(found, code) !== 0;
+      }
+    };
+  }
+
+  // cmap 格式 6：连续区间映射
+  function format6(view, offset, limit) {
+    if (offset + 10 > limit) { return null; }
+    var first = view.getUint16(offset + 6);
+    var count = view.getUint16(offset + 8);
+    var arrayBase = offset + 10;
+    if (arrayBase + count * 2 > limit) { return null; }
+    return {
+      size: count,
+      each: function (cb) {
+        for (var i = 0; i < count; i++) {
+          if (view.getUint16(arrayBase + i * 2) !== 0) { cb(first + i); }
+        }
+      },
+      has: function (code) {
+        if (code < first || code >= first + count) { return false; }
+        return view.getUint16(arrayBase + (code - first) * 2) !== 0;
+      }
+    };
+  }
+
+  // cmap 格式 12 / 13：分组映射（13 为多对一）
+  function format12(view, offset, limit, manyToOne) {
+    if (offset + 16 > limit) { return null; }
+    var count = view.getUint32(offset + 12);
+    if (count > (limit - offset - 16) / 12) { return null; }
+    var groupsBase = offset + 16;
+
+    function glyphAt(group, code) {
+      var p = groupsBase + group * 12;
+      var start = view.getUint32(p);
+      var glyph = view.getUint32(p + 8);
+      return manyToOne ? glyph : glyph + (code - start);
+    }
+
+    var size = 0;
+    for (var i = 0; i < count; i++) {
+      var p = groupsBase + i * 12;
+      size += view.getUint32(p + 4) - view.getUint32(p) + 1;
+    }
+
+    return {
+      size: size,
+      each: function (cb) {
+        for (var i = 0; i < count; i++) {
+          var p = groupsBase + i * 12;
+          var start = view.getUint32(p);
+          var end = view.getUint32(p + 4);
+          for (var code = start; code <= end; code++) {
+            if (glyphAt(i, code) !== 0) { cb(code); }
+          }
+        }
+      },
+      has: function (code) {
+        var lo = 0;
+        var hi = count - 1;
+        while (lo <= hi) {
+          var mid = (lo + hi) >> 1;
+          var p = groupsBase + mid * 12;
+          var start = view.getUint32(p);
+          var end = view.getUint32(p + 4);
+          if (code < start) { hi = mid - 1; }
+          else if (code > end) { lo = mid + 1; }
+          else { return glyphAt(mid, code) !== 0; }
+        }
+        return false;
+      }
+    };
+  }
+
+  function parseSubtables(view, buffer, cmap) {
+    var start = cmap.offset;
+    var limit = Math.min(buffer.byteLength, cmap.offset + cmap.length);
+    if (start + 4 > limit) {
+      throw new Error('cmap 表不完整，文件可能已损坏。');
+    }
+    var count = view.getUint16(start + 2);
+    var seen = Object.create(null);
+    var subtables = [];
+
+    for (var i = 0; i < count; i++) {
+      var p = start + 4 + i * 8;
+      if (p + 8 > limit) { break; }
+      var platformID = view.getUint16(p);
+      var encodingID = view.getUint16(p + 2);
+      if (!isUnicodeEncoding(platformID, encodingID)) { continue; }
+      var sub = start + view.getUint32(p + 4);
+      if (sub + 4 > limit || seen[sub]) { continue; }
+      seen[sub] = true;
+
+      var format = view.getUint16(sub);
+      var table = null;
+      if (format === 0) { table = format0(view, sub, limit); }
+      else if (format === 4) { table = format4(view, sub, limit); }
+      else if (format === 6) { table = format6(view, sub, limit); }
+      else if (format === 12) { table = format12(view, sub, limit, false); }
+      else if (format === 13) { table = format12(view, sub, limit, true); }
+      if (table) { subtables.push(table); }
+    }
+
+    if (!subtables.length) {
+      throw new Error('该字体没有可用的 Unicode 字符映射表（cmap）。');
+    }
+    return subtables;
+  }
+
+  // 合并多个 Unicode 子表：总量可控时建成 Set，否则退化为逐表二分查找
+  function buildCoverage(subtables) {
+    var total = 0;
+    for (var i = 0; i < subtables.length; i++) { total += subtables[i].size; }
+
+    if (total <= MATERIALIZE_LIMIT) {
+      var set = new Set();
+      subtables.forEach(function (table) {
+        table.each(function (code) { set.add(code); });
+      });
+      return {
+        exact: true,
+        count: set.size,
+        has: function (code) { return set.has(code); }
+      };
+    }
+
+    return {
+      exact: false,
+      count: total,
+      has: function (code) {
+        for (var j = 0; j < subtables.length; j++) {
+          if (subtables[j].has(code)) { return true; }
+        }
+        return false;
+      }
+    };
+  }
+
+  /* ---------- name 表（字体名称） ---------- */
+
+  function decodeUTF16BE(bytes) {
+    var out = '';
+    for (var i = 0; i + 1 < bytes.length; i += 2) {
+      out += String.fromCharCode((bytes[i] << 8) | bytes[i + 1]);
+    }
+    return out;
+  }
+
+  function parseNameMeta(view, buffer, table) {
+    var limit = Math.min(buffer.byteLength, table.offset + table.length);
+    var meta = { records: [], stringsBase: 0, limit: limit };
+    if (table.offset + 6 > limit) { return meta; }
+    var count = view.getUint16(table.offset + 2);
+    meta.stringsBase = table.offset + view.getUint16(table.offset + 4);
+    for (var i = 0; i < count; i++) {
+      var p = table.offset + 6 + i * 12;
+      if (p + 12 > limit) { break; }
+      meta.records.push({
+        platformID: view.getUint16(p),
+        encodingID: view.getUint16(p + 2),
+        languageID: view.getUint16(p + 4),
+        nameID: view.getUint16(p + 6),
+        length: view.getUint16(p + 8),
+        offset: view.getUint16(p + 10)
+      });
+    }
+    return meta;
+  }
+
+  function decodeRecord(view, meta, record) {
+    var start = meta.stringsBase + record.offset;
+    var end = Math.min(meta.limit, start + record.length);
+    if (start >= end) { return ''; }
+    var bytes = [];
+    for (var i = start; i < end; i++) { bytes.push(view.getUint8(i)); }
+    if (record.platformID === 1) {
+      return String.fromCharCode.apply(null, bytes);
+    }
+    return decodeUTF16BE(bytes);
+  }
+
+  function fontName(view, meta, nameID) {
+    var i;
+    var j;
+    var record;
+    var value;
+    for (i = 0; i < PREFERRED_NAMES.length; i++) {
+      for (j = 0; j < meta.records.length; j++) {
+        record = meta.records[j];
+        if (record.nameID !== nameID) { continue; }
+        if (record.platformID !== PREFERRED_NAMES[i][0]) { continue; }
+        if (record.encodingID !== PREFERRED_NAMES[i][1]) { continue; }
+        if (record.languageID !== PREFERRED_NAMES[i][2]) { continue; }
+        value = decodeRecord(view, meta, record).trim();
+        if (value) { return value; }
+      }
+    }
+    for (j = 0; j < meta.records.length; j++) {
+      if (meta.records[j].nameID !== nameID) { continue; }
+      value = decodeRecord(view, meta, meta.records[j]).trim();
+      if (value) { return value; }
+    }
+    return '';
+  }
+
+  /* ---------- 字体分析入口 ---------- */
+
+  function analyzeFont(buffer) {
+    var parsed = parseTables(buffer);
+    var view = parsed.view;
+    var coverage = buildCoverage(parseSubtables(view, buffer, parsed.tables.cmap));
+
+    var meta = parsed.tables.name
+      ? parseNameMeta(view, buffer, parsed.tables.name)
+      : { records: [], stringsBase: 0, limit: 0 };
+    var family = fontName(view, meta, 1);
+    var fullName = fontName(view, meta, 4) || family;
+
+    return { family: family, fullName: fullName, coverage: coverage };
+  }
+
+  /* ---------- 文本按码点切分 ---------- */
+
+  function toChars(text) {
+    var out = [];
+    for (var i = 0; i < text.length; i++) {
+      var code = text.charCodeAt(i);
+      if (code >= 0xD800 && code <= 0xDBFF && i + 1 < text.length) {
+        var next = text.charCodeAt(i + 1);
+        if (next >= 0xDC00 && next <= 0xDFFF) {
+          out.push(text.substr(i, 2));
+          i++;
+          continue;
+        }
+      }
+      out.push(text.charAt(i));
+    }
+    return out;
+  }
+
+  function codePointOf(character) {
+    if (character.length === 2) {
+      return (character.charCodeAt(0) - 0xD800) * 0x400
+        + (character.charCodeAt(1) - 0xDC00) + 0x10000;
+    }
+    return character.charCodeAt(0);
+  }
+
+  function codeLabel(character) {
+    var cp = codePointOf(character);
+    return 'U+' + cp.toString(16).toUpperCase().padStart(4, '0');
+  }
+
+  var SHOWN = { ' ': '␠ 空格', '\n': '↵ 换行', '\t': '⇥ 制表符', '\r': '␍ 回车' };
+
+  function shownChar(character) {
+    return SHOWN[character] || character;
+  }
+
+  /* ---------- 页面状态 ---------- */
+
+  var els = {
+    file: document.getElementById('fontFile'),
+    input: document.getElementById('input'),
+    preview: document.getElementById('preview'),
+    previewEmpty: document.getElementById('previewEmpty'),
+    missingBody: document.getElementById('missingBody'),
+    missingEmpty: document.getElementById('missingEmpty'),
+    charCount: document.getElementById('charCount'),
+    missingMeta: document.getElementById('missingMeta'),
+    fontMeta: document.getElementById('fontMeta'),
+    status: document.getElementById('status'),
+    copy: document.getElementById('copy'),
+    sample: document.getElementById('sample'),
+    clear: document.getElementById('clear')
+  };
+
+  var state = {
+    coverage: null,
+    total: 0,
+    missing: [],       // [{ text, code, count, positions }]
+    missingPoints: 0
+  };
+
+  var previewFamily = '';
+  var previewUrl = null;
+
+  function count(n) {
+    return n.toLocaleString('zh-CN');
+  }
+
+  function setStatus(text, ok) {
+    els.status.textContent = text;
+    els.status.classList.toggle('active', !!ok);
+  }
+
+  function resetFont() {
+    state.coverage = null;
+    previewFamily = '';
+    els.preview.style.fontFamily = '';
+    els.fontMeta.textContent = '尚未选择字体';
+    if (previewUrl) {
+      URL.revokeObjectURL(previewUrl);
+      previewUrl = null;
+    }
+  }
+
+  async function loadFont(file) {
+    resetFont();
+    setStatus('正在读取字体…', false);
+    els.fontMeta.textContent = file.name;
+
+    var buffer;
+    try {
+      buffer = await file.arrayBuffer();
+    } catch (e) {
+      refresh();
+      els.file.value = '';
+      els.fontMeta.textContent = '尚未选择字体';
+      setStatus('字体读取失败：无法读取文件', false);
+      return;
+    }
+
+    var info;
+    try {
+      info = analyzeFont(buffer);
+    } catch (error) {
+      refresh();
+      els.file.value = '';
+      els.fontMeta.textContent = '尚未选择字体';
+      setStatus('字体读取失败：' + error.message, false);
+      return;
+    }
+
+    state.coverage = info.coverage;
+    var mapped = info.coverage.exact ? count(info.coverage.count) : '约 ' + count(info.coverage.count);
+    var name = info.fullName || file.name;
+    els.fontMeta.textContent = name + (info.family && info.family !== name ? '（' + info.family + '）' : '')
+      + ' · ' + mapped + ' 个 Unicode 映射';
+
+    // 用所选字体预览；加载失败时只影响预览，不影响校验结果
+    try {
+      if (previewUrl) { URL.revokeObjectURL(previewUrl); }
+      previewUrl = URL.createObjectURL(new Blob([buffer], { type: file.type || 'font/ttf' }));
+      var face = new FontFace('FontCheckPreview', 'url(' + previewUrl + ')');
+      await face.load();
+      document.fonts.add(face);
+      previewFamily = 'FontCheckPreview';
+    } catch (e) {
+      previewFamily = '';
+    }
+
+    refresh();
+  }
+
+  /* ---------- 校验与渲染 ---------- */
+
+  function refresh() {
+    var text = els.input.value;
+    var chars = toChars(text);
+    state.total = chars.length;
+    els.charCount.textContent = count(chars.length) + ' 字符';
+
+    if (!state.coverage) {
+      els.preview.hidden = true;
+      els.previewEmpty.hidden = false;
+      els.previewEmpty.textContent = '选择字体并输入字符串后，这里会用所选字体逐字符显示包含情况。';
+      els.missingMeta.textContent = '0 种 / 0 处';
+      els.missingEmpty.hidden = false;
+      els.missingEmpty.textContent = '选择字体并输入字符串后，缺失的字符会按编码列在这里。';
+      var stale = els.missingBody.querySelector('.table-wrap');
+      if (stale) { stale.remove(); }
+      setStatus('等待选择字体', false);
+      return;
+    }
+
+    if (!chars.length) {
+      state.missing = [];
+      state.missingPoints = 0;
+      els.preview.hidden = true;
+      els.previewEmpty.hidden = false;
+      els.previewEmpty.textContent = '字体已就绪，输入字符串后这里会显示逐字符的包含情况。';
+      renderMissing();
+      setStatus('等待输入', false);
+      return;
+    }
+
+    var coverage = state.coverage;
+    var groups = Object.create(null);
+    var order = [];
+    var missingPoints = 0;
+    var shown = Math.min(chars.length, PREVIEW_LIMIT);
+
+    var frag = document.createDocumentFragment();
+    for (var i = 0; i < chars.length; i++) {
+      var character = chars[i];
+      var point = codePointOf(character);
+      // 换行、制表符等控制字符不参与校验，字体 cmap 里通常不会收录它们
+      var isControl = point < 0x20 || point === 0x7F;
+      var ok = isControl ? null : coverage.has(point);
+      if (ok === false) {
+        missingPoints++;
+        if (!groups[character]) {
+          groups[character] = { text: character, code: codeLabel(character), count: 0, positions: [] };
+          order.push(character);
+        }
+        groups[character].count++;
+        if (groups[character].positions.length < 20) {
+          groups[character].positions.push(i + 1);
+        }
+      }
+      if (i < shown) {
+        var span = document.createElement('span');
+        span.textContent = character;
+        span.className = ok === null ? 'skip' : (ok ? 'ok' : 'miss');
+        span.title = codeLabel(character)
+          + (ok === null ? ' · 控制字符，不参与校验' : (ok ? ' · 字体包含' : ' · 字体缺失'));
+        frag.appendChild(span);
+      }
+    }
+
+    state.missing = order.map(function (key) { return groups[key]; });
+    state.missingPoints = missingPoints;
+
+    els.preview.replaceChildren(frag);
+    if (chars.length > shown) {
+      var more = document.createElement('p');
+      more.className = 'pane-hint';
+      more.textContent = '预览只显示前 ' + count(shown) + ' 个字符，校验结果仍按全文统计。';
+      els.preview.appendChild(more);
+    }
+    els.preview.style.fontFamily = previewFamily
+      ? previewFamily + ', ui-sans-serif, system-ui, sans-serif'
+      : '';
+    els.preview.hidden = false;
+    els.previewEmpty.hidden = true;
+
+    renderMissing();
+
+    if (missingPoints === 0) {
+      setStatus('✓ 字体包含全部字符', true);
+    } else {
+      setStatus('✕ 字体缺少部分字符 · ' + count(missingPoints) + ' 处 / ' + count(order.length) + ' 种', false);
+    }
+  }
+
+  function renderMissing() {
+    var body = els.missingBody;
+    var wrap = body.querySelector('.table-wrap');
+    if (wrap) { wrap.remove(); }
+
+    var list = state.missing;
+    els.missingMeta.textContent = count(list.length) + ' 种 / ' + count(state.missingPoints) + ' 处';
+
+    if (!list.length) {
+      els.missingEmpty.hidden = false;
+      els.missingEmpty.textContent = state.coverage
+        ? (state.total ? '没有缺失字符，字体覆盖了输入的全部字符。' : '还没有输入字符串。')
+        : '选择字体并输入字符串后，缺失的字符会按编码列在这里。';
+      return;
+    }
+    els.missingEmpty.hidden = true;
+
+    var scroll = document.createElement('div');
+    scroll.className = 'table-wrap';
+
+    var table = document.createElement('table');
+    table.className = 'data-table';
+
+    var thead = document.createElement('thead');
+    var headRow = document.createElement('tr');
+    ['字符', '编码', '次数', '位置'].forEach(function (text) {
+      var th = document.createElement('th');
+      th.textContent = text;
+      headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    var tbody = document.createElement('tbody');
+    list.forEach(function (item) {
+      var tr = document.createElement('tr');
+      var cells = [
+        shownChar(item.text),
+        item.code,
+        String(item.count),
+        item.positions.join(', ') + (item.count > item.positions.length ? ' …' : '')
+      ];
+      cells.forEach(function (text) {
+        var td = document.createElement('td');
+        td.textContent = text;
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+
+    scroll.appendChild(table);
+    body.appendChild(scroll);
+  }
+
+  /* ---------- 复制缺失明细 ---------- */
+
+  var copyTimer = null;
+
+  function flashCopy(text) {
+    els.copy.textContent = text;
+    if (copyTimer) { clearTimeout(copyTimer); }
+    copyTimer = setTimeout(function () { els.copy.textContent = '复制'; }, 1200);
+  }
+
+  function missingText() {
+    if (!state.missing.length) { return ''; }
+    var lines = ['字符\t编码\t次数\t位置'];
+    state.missing.forEach(function (item) {
+      lines.push(shownChar(item.text) + '\t' + item.code + '\t' + item.count + '\t'
+        + item.positions.join(', ') + (item.count > item.positions.length ? ' …' : ''));
+    });
+    return lines.join('\n');
+  }
+
+  function copyMissing() {
+    var text = missingText();
+    if (!text) {
+      flashCopy('无缺失');
+      return;
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () {
+        flashCopy('已复制');
+      }, function () {
+        fallbackCopy(text);
+      });
+    } else {
+      fallbackCopy(text);
+    }
+  }
+
+  function fallbackCopy(text) {
+    var area = document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.top = '-1000px';
+    document.body.appendChild(area);
+    area.select();
+    try {
+      document.execCommand('copy');
+      flashCopy('已复制');
+    } catch (e) {
+      flashCopy('复制失败');
+    }
+    document.body.removeChild(area);
+  }
+
+  /* ---------- 事件 ---------- */
+
+  var SAMPLE = '张三 李四 王五\n'
+    + '门诊号 A0001 · 住院号 Z9002\n'
+    + '金额 ¥1,234.56 ± ℃ µ ① ㈱ ㊣ 龘 𠮷\n'
+    + '备注：体温 36.8℃，药名「阿莫西林」已核对。';
+
+  els.file.addEventListener('change', function () {
+    var file = els.file.files && els.file.files[0];
+    if (file) { loadFont(file); }
+  });
+
+  els.input.addEventListener('input', refresh);
+  els.copy.addEventListener('click', copyMissing);
+
+  els.clear.addEventListener('click', function () {
+    els.input.value = '';
+    refresh();
+    els.input.focus();
+  });
+
+  els.sample.addEventListener('click', function () {
+    els.input.value = SAMPLE;
+    refresh();
+    els.input.focus();
+    els.input.scrollTop = 0;
+  });
+
+  // 直接把字体文件拖进页面也能加载
+  function droppedFont(event) {
+    var files = event.dataTransfer && event.dataTransfer.files;
+    return files && files.length ? files[0] : null;
+  }
+
+  document.addEventListener('dragover', function (event) {
+    if (droppedFont(event)) {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'copy';
+    }
+  });
+
+  document.addEventListener('drop', function (event) {
+    var file = droppedFont(event);
+    if (!file) { return; }
+    event.preventDefault();
+    loadFont(file);
+  });
+
+  refresh();
+})();
+</script>
+</body>
+</html>

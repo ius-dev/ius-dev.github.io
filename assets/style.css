@@ -468,6 +468,57 @@ input[type="text"].invalid { border-color: #7a3b46; }
 
 select:disabled { color: var(--faint); cursor: not-allowed; }
 
+/* 文件选择 */
+
+input[type="file"] {
+  max-width: 100%;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12.5px;
+}
+
+input[type="file"]::file-selector-button {
+  margin-right: 10px;
+  padding: 7px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background .15s, border-color .15s;
+}
+
+input[type="file"]::file-selector-button:hover {
+  border-color: var(--line-strong);
+  background: #1a2029;
+}
+
+/* 逐字符标记（字体覆盖情况） */
+
+.char-preview {
+  font-size: 21px;
+  line-height: 1.95;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.char-preview .ok { color: var(--accent); }
+
+.char-preview .miss {
+  background: rgba(242, 160, 173, .16);
+  color: #f2a0ad;
+  text-decoration: underline 2px #f2a0ad;
+  text-underline-offset: 3px;
+}
+
+.char-preview .skip { color: var(--faint); }
+
+/* 与 .panes 垂直堆叠的整宽面板 */
+
+.pane-stack { margin-top: 16px; }
+
 /* 行式表单（可增删的行） */
 
 .field-rows {
